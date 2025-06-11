@@ -67,12 +67,23 @@ class PiedpiprModSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName('Phantom Note Confirmation')
-            .setDesc('Show confirmation dialog before creating new notes from phantom links')
+            .setName('Confirm All New Notes')
+            .setDesc('Show confirmation dialog before creating ANY new notes')
             .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.phantomNoteConfirmation)
+                .setValue(this.plugin.settings.confirmAllNewNotes)
                 .onChange(async (value) => {
-                    this.plugin.settings.phantomNoteConfirmation = value;
+                    this.plugin.settings.confirmAllNewNotes = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.updateFeatureStates();
+                }));
+
+        new Setting(containerEl)
+            .setName('Confirm Phantom Notes Only')
+            .setDesc('Show confirmation dialog only for phantom notes (notes created from non-existing links)')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.confirmPhantomNotesOnly)
+                .onChange(async (value) => {
+                    this.plugin.settings.confirmPhantomNotesOnly = value;
                     await this.plugin.saveSettings();
                     this.plugin.updateFeatureStates();
                 }));
@@ -95,11 +106,10 @@ class PiedpirsModPlugin extends Plugin {
     constructor(app, manifest) {
         super(app, manifest);
         this.originalCreateNewFile = null;
-        this.editorChangeHandler = null;
+        this.keydownHandler = null;
         this.activeLeafChangeHandler = null;
-        this.currentEditor = null;
-        this.lastProcessedContent = '';
         this.processedFiles = new Set();
+        this.isCreatingFromPhantomLink = false;
     }
 
     async onload() {
@@ -123,6 +133,9 @@ class PiedpirsModPlugin extends Plugin {
                 }
             });
 
+            // Hook into link click events to detect phantom link creation
+            this.registerDomEvent(document, 'click', this.handleLinkClick.bind(this));
+
             this.updateFeatureStates();
             new Notice('Piedpipr\'s Mod loaded!');
             
@@ -135,7 +148,8 @@ class PiedpirsModPlugin extends Plugin {
     async loadSettings() {
         const defaultSettings = {
             blockReferenceAlias: true,
-            phantomNoteConfirmation: true,
+            confirmAllNewNotes: false,
+            confirmPhantomNotesOnly: true,
             autoHideProperties: false
         };
         
@@ -155,39 +169,76 @@ class PiedpirsModPlugin extends Plugin {
 
     updateBlockReferenceFeature() {
         // Clean up existing handler
-        if (this.editorChangeHandler) {
-            this.app.workspace.off('editor-change', this.editorChangeHandler);
-            this.editorChangeHandler = null;
+        if (this.keydownHandler) {
+            document.removeEventListener('keydown', this.keydownHandler);
+            this.keydownHandler = null;
         }
 
         if (this.settings.blockReferenceAlias) {
-            // Use editor-change event instead of global keydown - much more efficient
-            this.editorChangeHandler = this.createEditorChangeHandler();
-            this.app.workspace.on('editor-change', this.editorChangeHandler);
+            this.keydownHandler = this.createKeydownHandler();
+            document.addEventListener('keydown', this.keydownHandler);
         }
     }
 
-    createEditorChangeHandler() {
-        return (editor, info) => {
-            // Only process if the change was typing (not programmatic)
-            if (!info.from || !info.to || info.text.length !== 1 || info.text[0] !== ' ') {
-                return;
-            }
-
-            // Quick check: only process if the line contains ]]
+    createKeydownHandler() {
+        return (event) => {
+            // Only process space key
+            if (event.code !== 'Space') return;
+            
+            // Get active editor
+            const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+            if (!activeView || !activeView.editor) return;
+            
+            const editor = activeView.editor;
             const cursor = editor.getCursor();
             const line = editor.getLine(cursor.line);
             
-            // Fast indexOf check before regex
-            if (line.indexOf(']]') === -1) return;
+            // Quick check: only process if the line contains ]] before cursor
+            const beforeCursor = line.substring(0, cursor.ch);
+            if (!beforeCursor.endsWith(']]')) return;
             
-            // Check if we just typed space after ]]
-            const beforeSpace = line.substring(0, cursor.ch - 1);
-            if (beforeSpace.endsWith(']]')) {
-                // Process immediately - no timeout needed since this only fires on actual changes
-                this.processCurrentLine(editor, cursor.line, line);
-            }
+            // Check if this is a block reference
+            if (beforeCursor.indexOf('#‣') === -1) return;
+            
+            // Prevent default space behavior temporarily
+            event.preventDefault();
+            
+            // Process the line first, then add the space
+            setTimeout(() => {
+                const updatedLine = editor.getLine(cursor.line);
+                const processed = this.processBlockReferenceLine(updatedLine);
+                
+                if (processed !== updatedLine) {
+                    editor.setLine(cursor.line, processed);
+                    // Move cursor to end of processed line
+                    editor.setCursor({ line: cursor.line, ch: processed.length });
+                    new Notice('✅ Added dash and alias to block reference');
+                } else {
+                    // If no processing was done, just add the space
+                    editor.replaceRange(' ', cursor);
+                }
+            }, 10);
         };
+    }
+
+    handleLinkClick(event) {
+        // Check if it's a wiki link
+        const target = event.target.closest('.internal-link');
+        if (!target) return;
+        
+        const href = target.getAttribute('href');
+        if (!href) return;
+        
+        // Check if the file exists
+        const file = this.app.metadataCache.getFirstLinkpathDest(href, '');
+        if (!file) {
+            // This is a phantom link
+            this.isCreatingFromPhantomLink = true;
+            // Reset flag after a short delay
+            setTimeout(() => {
+                this.isCreatingFromPhantomLink = false;
+            }, 1000);
+        }
     }
 
     updatePhantomNoteFeature() {
@@ -197,7 +248,7 @@ class PiedpirsModPlugin extends Plugin {
             this.originalCreateNewFile = null;
         }
 
-        if (this.settings.phantomNoteConfirmation) {
+        if (this.settings.confirmAllNewNotes || this.settings.confirmPhantomNotesOnly) {
             this.originalCreateNewFile = this.app.vault.create.bind(this.app.vault);
             this.app.vault.create = this.interceptCreateNewFile.bind(this);
         }
@@ -254,39 +305,61 @@ class PiedpirsModPlugin extends Plugin {
     }
 
     async interceptCreateNewFile(path, data) {
-        if (path.endsWith('.md') && !await this.app.vault.adapter.exists(path)) {
-            return new Promise((resolve, reject) => {
-                const fileName = path.replace(/\.md$/, '');
-                const modal = new PhantomNoteConfirmModal(
-                    this.app,
-                    fileName,
-                    async () => {
-                        try {
-                            const result = await this.originalCreateNewFile(path, data);
-                            new Notice(`✅ Created note: ${fileName}`);
-                            resolve(result);
-                        } catch (error) {
-                            reject(error);
-                        }
-                    },
-                    () => {
-                        new Notice('Note creation cancelled');
-                        reject(new Error('Note creation cancelled by user'));
-                    }
-                );
-                modal.open();
-            });
+        if (!path.endsWith('.md')) {
+            return this.originalCreateNewFile(path, data);
         }
-        return this.originalCreateNewFile(path, data);
+
+        const fileExists = await this.app.vault.adapter.exists(path);
+        if (fileExists) {
+            return this.originalCreateNewFile(path, data);
+        }
+
+        // Determine if we should show confirmation
+        let shouldConfirm = false;
+        
+        if (this.settings.confirmAllNewNotes) {
+            shouldConfirm = true;
+        } else if (this.settings.confirmPhantomNotesOnly && this.isCreatingFromPhantomLink) {
+            shouldConfirm = true;
+        }
+
+        if (!shouldConfirm) {
+            return this.originalCreateNewFile(path, data);
+        }
+
+        return new Promise((resolve, reject) => {
+            const fileName = path.replace(/\.md$/, '').split('/').pop();
+            const modal = new PhantomNoteConfirmModal(
+                this.app,
+                fileName,
+                async () => {
+                    try {
+                        const result = await this.originalCreateNewFile(path, data);
+                        new Notice(`✅ Created note: ${fileName}`);
+                        resolve(result);
+                    } catch (error) {
+                        reject(error);
+                    }
+                },
+                () => {
+                    new Notice('Note creation cancelled');
+                    reject(new Error('Note creation cancelled by user'));
+                }
+            );
+            modal.open();
+        });
     }
 
-    processCurrentLine(editor, lineNum, lineContent) {
+    processBlockReferenceLine(lineContent) {
         try {
             // Fast check using indexOf before regex
-            if (lineContent.indexOf('#‣') === -1) return;
+            if (lineContent.indexOf('#‣') === -1) return lineContent;
             
             // Single pass regex with efficient replacement
-            const newLine = lineContent.replace(/\[\[([^|\]]+?#‣[^|\]]+?)\]\]/g, (match, linkContent) => {
+            return lineContent.replace(/\[\[([^|\]]+?#‣[^|\]]+?)\]\]/g, (match, linkContent) => {
+                // Skip if already has alias
+                if (match.includes('|')) return match;
+                
                 // Extract block ID efficiently
                 const lastHash = linkContent.lastIndexOf('#‣');
                 if (lastHash === -1) return match;
@@ -300,14 +373,9 @@ class PiedpirsModPlugin extends Plugin {
                 }
                 return match;
             });
-            
-            // Only update if changed
-            if (newLine !== lineContent) {
-                editor.setLine(lineNum, newLine);
-                new Notice(`✅ Added dash and alias to block reference`);
-            }
         } catch (error) {
             console.error('Error processing line:', error);
+            return lineContent;
         }
     }
 
@@ -328,25 +396,18 @@ class PiedpirsModPlugin extends Plugin {
             
             let replacementCount = 0;
             
-            // Single pass replacement
-            const processedContent = fullContent.replace(/\[\[([^|\]]+?#‣[^|\]]+?)\]\]/g, (match, linkContent) => {
-                // Extract block ID efficiently
-                const lastHash = linkContent.lastIndexOf('#‣');
-                if (lastHash === -1) return match;
-                
-                const afterHash = linkContent.substring(lastHash + 2);
-                const blockIdMatch = afterHash.match(/([A-Z0-9]{4,})$/);
-                
-                if (blockIdMatch) {
-                    const blockId = blockIdMatch[1];
+            // Process line by line for better control
+            const lines = fullContent.split('\n');
+            const processedLines = lines.map(line => {
+                const processed = this.processBlockReferenceLine(line);
+                if (processed !== line) {
                     replacementCount++;
-                    return ` - [[${linkContent}|${blockId}]]`;
                 }
-                return match;
+                return processed;
             });
             
             if (replacementCount > 0) {
-                editor.setValue(processedContent);
+                editor.setValue(processedLines.join('\n'));
                 new Notice(`✅ Added dashes and aliases to ${replacementCount} block reference${replacementCount === 1 ? '' : 's'}`);
             } else {
                 new Notice('ℹ️ No block references needed aliases');
@@ -360,9 +421,9 @@ class PiedpirsModPlugin extends Plugin {
     onunload() {
         try {
             // Clean up event listeners
-            if (this.editorChangeHandler) {
-                this.app.workspace.off('editor-change', this.editorChangeHandler);
-                this.editorChangeHandler = null;
+            if (this.keydownHandler) {
+                document.removeEventListener('keydown', this.keydownHandler);
+                this.keydownHandler = null;
             }
             
             if (this.activeLeafChangeHandler) {
