@@ -1,0 +1,10 @@
+{
+    "id": "piedpiprs-mod",
+    "name": "Piedpipr's Mod",
+    "version": "1.0.0",
+    "minAppVersion": "0.15.0",
+    "description": "Modular plugin with block reference aliases and phantom note confirmation",
+    "author": "Piedpipr",
+    "authorUrl": "",
+    "isDesktopOnly": false
+}
