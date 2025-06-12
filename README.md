@@ -1,5 +1,5 @@
 # Osidian Piedpipr's Mod
-This is collection of my custom functionalities that i wish obsidian had by default hence the plugin. This can help in buildingg excellent Obsidian + Zotero + Pandoc research workflow for reading, annotating, note taking writing and daily zettelkasten overall !
+This is collection of my custom functionalities that I wish Obsidian had by default hence the plugin. Since using Templater or other script seems cumbersome to me, so I had to automate things a bit. This can help in buildingg excellent Obsidian + Zotero + Pandoc research workflow for reading, annotating, note taking writing and daily zettelkasten overall !
 ![image](https://github.com/user-attachments/assets/6ab0c612-7c74-4cfc-a790-8dbccd5e4269)
 
 ## Writing Papers: Ease of searchable information management, visualization and linking (follows and works with my personal workflow)
